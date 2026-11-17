@@ -11,7 +11,7 @@ A long-only bot for make.fun's 24-hour cbBTC race (agent-fun/bars-replay/v1).
 ## Dev mode (fitted to the published dev window — said plainly)
 The dev window is published in the kit. A dynamic program over its 1,440 bars, using the replay's
 own fill model (fill at the next bar's open, 4 bps fee, 2 bps slippage, price impact against the
-open depth), chose a schedule of target positions in steps of 1/32 of equity (0 to 100%).
+open depth), chose a schedule of target positions in steps of 1/200 of equity (0 to 100%).
 Small steps pay less impact than full-size orders. The bot uses this schedule only when its first
 bar is the dev window's first bar. It is hindsight, not a forecast: it exists to pass the dev gate
 and says nothing about the race.
