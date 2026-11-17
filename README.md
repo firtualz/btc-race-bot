@@ -23,6 +23,8 @@ The generic dip-bounce strategy of v2:
   8 bps or more above the bar before it while still under the EMA.
 - Exit: once a close is 0.7% above the entry close, sell on the first close 5 bps below the highest
   close since the buy; emergency stop at -3%.
+- Guardrail fallback: if nothing has filled by batch 1380, buy once with all cash and sell it at
+  batch 1400, so the window always has an own filled trade.
 
 At most one order per reply, no clock, no randomness: fully deterministic.
 

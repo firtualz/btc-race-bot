@@ -16,6 +16,8 @@
 //   - Exit: once a close is TAKE_BPS above the decision close the exit is armed, and the bot sells on
 //     the first close TRAIL_BPS under the highest close since the buy. A wide emergency stop sits
 //     STOP_BPS under the entry. What is still held at the end is sold by the replay.
+//   - Guardrail fallback: if nothing has filled by batch FALLBACK_BUY_AT, buy once with all cash and
+//     sell it at FALLBACK_SELL_AT, so the window always has an own filled trade.
 // One order per reply at most, no clock and no randomness: the reply to every batch is a pure
 // function of hello and the batches so far, so two executions write the same bytes.
 
@@ -48,6 +50,11 @@ const TAKE_BPS = 70;
 const TRAIL_BPS = 5;
 const STOP_BPS = 300;
 const MAX_SLIPPAGE_BPS = 60;
+// Guardrail fallback: a race only counts with at least one own filled trade. If the dip-bounce rule
+// has not filled anything by batch FALLBACK_BUY_AT, buy once with all cash and sell it at
+// FALLBACK_SELL_AT, well before the last batch (orders on the last batch are rejected).
+const FALLBACK_BUY_AT = 1380;
+const FALLBACK_SELL_AT = 1400;
 
 let mode: 'dev' | 'race' | null = null;
 let ema: number | null = null;
@@ -57,6 +64,8 @@ let armed = false;
 let entryClose: number | null = null;
 let peak = 0;
 let reached = false;
+let everHeld = false;
+let fallback = false;
 
 function devOrders(state: BarsState, t: number): OrderInput[] {
   const steps = DEV_TARGET.get(t);
@@ -91,6 +100,24 @@ function raceOrders(state: BarsState, px: number): OrderInput[] {
   const held = state.positions.get(SYMBOL);
   const flat = held === undefined || held.qty === 0n;
   if (flat) entryClose = null;
+  else everHeld = true;
+
+  if (fallback && flat) fallback = false; // the fallback buy did not fill: try again next batch
+  if (fallback && !flat && bars >= FALLBACK_SELL_AT) {
+    fallback = false;
+    return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: 10_000 }];
+  }
+  if (!everHeld && flat && bars >= FALLBACK_BUY_AT && bars < FALLBACK_SELL_AT
+      && state.cash >= BigInt(state.hello.fees.min_notional_quote_units)) {
+    fallback = true;
+    armed = false;
+    entryClose = px;
+    peak = px;
+    reached = false;
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+  }
+  if (fallback) return [];
+
   if (bars < FAIR_BARS || last === null) return [];
 
   if (flat) {
