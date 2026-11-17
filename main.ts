@@ -1,58 +1,75 @@
-// Dip-revert: a long-only mean-reversion bot for cbBTC/USDC on agent-fun/bars-replay/v1.
+// Dip-bounce v2: a long-only cbBTC/USDC bot for agent-fun/bars-replay/v1.
 //
-// Idea: on one-minute bars BTC's pool price wanders around a slow average far more often than it
-// trends, and a full round trip costs ~26 bps, so the bot trades rarely and only on a clear dip.
-//   - Fair value: an EMA of the last ~120 closes (two hours), updated on every bar.
-//   - Entry: flat, and the latest close sits at least DIP_BPS below the EMA -> buy with all cash.
-//   - Exit: take profit once the close is TAKE_BPS above the entry close, or cut the loss once it
-//     is STOP_BPS below it. Whatever is still held at the end is sold by the replay itself.
-// Every reply carries at most one order, far below the 16-order cap, and nothing reads the clock:
-// the bot is a pure function of the hello and the batches, so two runs write the same bytes.
+// v1 bought the moment price sat 0.4% under a 2-hour EMA, and on the dev window those dips kept
+// falling (one-minute returns carry ~0.15 autocorrelation: a drop tends to run on for a few bars).
+// v2 waits for the turn instead:
+//   - Fair value: an EMA of the last FAIR_BARS closes.
+//   - Arm: once a close sits DIP_BPS or more under the EMA the bot is armed (disarmed again when
+//     price gets back to the EMA without a signal).
+//   - Entry: armed, still under the EMA, and the latest bar closed BOUNCE_BPS or more above the
+//     close before it -> buy with all cash at the next bar's open.
+//   - Exit: once a close is TAKE_BPS above the decision close the exit is armed, and the bot sells
+//     on the first close that gives back TRAIL_BPS from the highest close since the buy (short-term
+//     moves run on, so the winner is ridden a little). A wide emergency stop sits STOP_BPS below
+//     the entry. What is still held at the end is sold by the replay itself.
+// One order per reply at most, no clock and no randomness: the bot is a pure function of the
+// hello and the batches, so two executions write the same bytes.
 
 import { runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const EMA_BARS = 120;
-const DIP_BPS = 40;
-const TAKE_BPS = 80;
-const STOP_BPS = 150;
-/** Buys may fill at most this far above the latest close (2 bps slippage + ~7 bps impact fit well inside). */
+const FAIR_BARS = 20;
+const DIP_BPS = 5;
+const BOUNCE_BPS = 8;
+/** Reaching this gain arms the exit; the bot then rides the run until a close gives back TRAIL_BPS. */
+const TAKE_BPS = 70;
+const TRAIL_BPS = 5;
+const STOP_BPS = 300;
 const MAX_SLIPPAGE_BPS = 60;
-/** After a stop-loss the bot waits this many bars before it buys a dip again: no catching a falling knife. */
-const COOLDOWN_BARS = 60;
 
 let ema: number | null = null;
-/** The bar count before which no new buy is sent (set when a stop-loss sells). */
-let quietUntil = 0;
+let prevClose: number | null = null;
 let bars = 0;
-/** The close the current position was bought against (the decision bar's close), or null when flat. */
+let armed = false;
 let entryClose: number | null = null;
-/** True while an order is waiting for its fill, so the bot never stacks a second one. */
+/** Highest close since the buy, and whether the take-profit level has been reached. */
+let peak = 0;
+let reached = false;
 let pending = false;
 
 function decide(state: BarsState): OrderInput[] {
   const close = state.close(SYMBOL);
   if (close === null) return [];
   const px = Number(close);
-  ema = ema === null ? px : ema + (2 / (EMA_BARS + 1)) * (px - ema);
+  const last = prevClose;
+  prevClose = px;
+  ema = ema === null ? px : ema + (2 / (FAIR_BARS + 1)) * (px - ema);
   bars += 1;
 
   const held = state.positions.get(SYMBOL);
-  if (held === undefined || held.qty === 0n) entryClose = null;
-  if (pending || bars < EMA_BARS) return [];
+  const flat = held === undefined || held.qty === 0n;
+  if (flat) entryClose = null;
+  if (pending || bars < FAIR_BARS || last === null) return [];
 
-  if (held === undefined || held.qty === 0n) {
-    if (bars >= quietUntil && px <= ema * (1 - DIP_BPS / 10_000) && state.cash >= BigInt(state.hello.fees.min_notional_quote_units)) {
+  if (flat) {
+    if (px <= ema * (1 - DIP_BPS / 10_000)) armed = true;
+    if (px >= ema) armed = false;
+    const bounced = px >= last * (1 + BOUNCE_BPS / 10_000);
+    if (armed && bounced && px < ema && state.cash >= BigInt(state.hello.fees.min_notional_quote_units)) {
+      armed = false;
       entryClose = px;
+      peak = px;
+      reached = false;
       return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
   }
 
   const ref = entryClose ?? px;
-  const stopped = px <= ref * (1 - STOP_BPS / 10_000);
-  if (stopped) quietUntil = bars + COOLDOWN_BARS;
-  if (stopped || px >= ref * (1 + TAKE_BPS / 10_000)) {
+  if (px > peak) peak = px;
+  if (px >= ref * (1 + TAKE_BPS / 10_000)) reached = true;
+  const trailed = reached && px <= peak * (1 - TRAIL_BPS / 10_000);
+  if (trailed || px <= ref * (1 - STOP_BPS / 10_000)) {
     return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: 10_000 }];
   }
   return [];
